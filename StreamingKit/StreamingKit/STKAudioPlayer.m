@@ -206,6 +206,11 @@ static AudioComponentDescription convertUnitDescription;
 static AudioStreamBasicDescription canonicalAudioStreamBasicDescription;
 static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 
+//PlaybackrateUnit Description
+static AudioComponentDescription playbackrateUnitDescription;
+
+
+
 @interface STKAudioPlayer()
 {
 	BOOL muted;
@@ -234,11 +239,18 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
 	AUNode eqOutputNode;
 	AUNode mixerInputNode;
 	AUNode mixerOutputNode;
-	
+    
     AudioComponentInstance eqUnit;
-	AudioComponentInstance mixerUnit;
-	AudioComponentInstance outputUnit;
-		
+    AudioComponentInstance mixerUnit;
+    AudioComponentInstance outputUnit;
+    
+    //PlaybackSpeedNode
+    AUNode playbackspeedNode;
+    //PlaybackSpeedUnit
+    AudioComponentInstance playbackspeedUnit;
+    
+    
+
     UInt32 eqBandCount;
     int32_t waitingForDataAfterSeekFrameCount;
 	
@@ -299,6 +311,10 @@ static AudioStreamBasicDescription recordAudioStreamBasicDescription;
     volatile BOOL disposeWasRequested;
     volatile BOOL seekToTimeWasRequested;
     volatile STKAudioPlayerStopReason stopReason;
+    
+    NSMutableData * m4aMdatHolding;
+    long m4aMdatLocation;
+    BOOL m4aMoovLoaded;
 }
 
 @property (readwrite) STKAudioPlayerInternalState internalState;
@@ -342,6 +358,18 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
 #else
     const int bytesPerSample = sizeof(AudioSampleType);
 #endif
+    
+    //PlaybackSpeedUnit Description
+    
+    playbackrateUnitDescription = (AudioComponentDescription)
+    {
+        .componentManufacturer	= kAudioUnitManufacturer_Apple,
+        .componentType			= kAudioUnitType_FormatConverter,
+        .componentSubType		= kAudioUnitSubType_AUiPodTimeOther,
+        .componentFlags			= 0,
+        .componentFlagsMask		= 0,
+        
+    };
     
     canonicalAudioStreamBasicDescription = (AudioStreamBasicDescription)
     {
@@ -773,6 +801,7 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     pthread_mutex_unlock(&playerMutex);
     
     [self wakeupPlaybackThread];
+    
 }
 
 -(void) queue:(NSString*)urlString
@@ -1142,9 +1171,25 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     currentlyReadingEntry = entry;
     OSSpinLockUnlock(&currentEntryReferencesLock);
     
+    
+//    //HACK DESCRIPTION
+//    AudioStreamBasicDescription newBasicDescription;
+//    newBasicDescription.mSampleRate = 44100.00;
+//    newBasicDescription.mFormatID = kAudioFormatMPEG4AAC;
+//    newBasicDescription.mFormatFlags = kMPEG4Object_AAC_LC;
+//    newBasicDescription.mChannelsPerFrame = 2;
+//    STKQueueEntry* entryToUpdate = currentlyReadingEntry;
+//    entryToUpdate->audioStreamBasicDescription = newBasicDescription;
+//    
+//    //HACK DATA OFFSET
+//    currentlyReadingEntry->parsedHeader = YES;
+//    currentlyPlayingEntry->packetBufferSize =
+//    currentlyReadingEntry->audioDataOffset = 57336;
+    
+    
     currentlyReadingEntry.dataSource.delegate = self;
     [currentlyReadingEntry.dataSource registerForEvents:[NSRunLoop currentRunLoop]];
-    [currentlyReadingEntry.dataSource seekToOffset:0];
+    [currentlyReadingEntry.dataSource seekToOffset:57336];
     
     [self closeRecordAudioFile];
     
@@ -1497,8 +1542,14 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
         
         error = AudioFileStreamSeek(audioFileStream, seekPacket, &packetAlignedByteOffset, &ioFlags);
         
-        if (!error && (ioFlags & kAudioFileStreamSeekFlag_OffsetIsEstimated))
+        if (!error && !(ioFlags & kAudioFileStreamSeekFlag_OffsetIsEstimated))
         {
+            double delta = ((seekByteOffset - (SInt64)currentEntry->audioDataOffset) - packetAlignedByteOffset) / calculatedBitRate * 8;
+            
+            OSSpinLockLock(&currentEntry->spinLock);
+            currentEntry->seekTime -= delta;
+            OSSpinLockUnlock(&currentEntry->spinLock);
+            
             seekByteOffset = packetAlignedByteOffset + currentEntry->audioDataOffset;
         }
     }
@@ -1524,6 +1575,31 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         [self resetPcmBuffers];
     }
+}
+
+- (long)locationMoov:(NSData *)data {
+    NSData *pattern = [@"mdat" dataUsingEncoding:NSASCIIStringEncoding];
+    NSData *patternMoov = [@"moov" dataUsingEncoding:NSASCIIStringEncoding];
+    NSRange range = [data rangeOfData:pattern options:0 range:NSMakeRange(0, data.length)];
+    NSRange rangeMoov = [data rangeOfData:patternMoov options:0 range:NSMakeRange(0, data.length)];
+    
+    if (rangeMoov.location != NSNotFound) {
+        return -2;  //找到了Moov，不用特殊处理了
+    }
+    
+    if (range.location != NSNotFound) {
+        
+        //1. 处理m4aMdataHolding，把locationL:mdat-4 之后bytes去掉
+        
+        
+        //[data getBytes:&flag range:NSMakeRange(range.location - range.length, 4)];
+        m4aMdatLocation = range.location - range.length;
+        NSData *data4 = [data subdataWithRange:NSMakeRange(m4aMdatLocation, 4)];
+        long value =  CFSwapInt32BigToHost(*(int*)([data4 bytes]));
+        return value + m4aMdatLocation;
+    }
+    
+    return -1;  //什么都没找到，继续找
 }
 
 -(void) dataSourceDataAvailable:(STKDataSource*)dataSourceIn
@@ -1577,13 +1653,55 @@ static void AudioFileStreamPacketsProc(void* clientData, UInt32 numberBytes, UIn
     {
         flags = kAudioFileStreamParseFlag_Discontinuity;
     }
-    
     if (audioFileStream)
     {
-        error = AudioFileStreamParseBytes(audioFileStream, read, readBuffer, flags);
+        NSLog(@"buffer read:%@", @(read));
+        
+        if ( m4aMoovLoaded == NO ) {      //M4A only logic
+            NSData * data = [NSData dataWithBytes:readBuffer length:read];
+            if ( m4aMdatHolding == nil ) {
+                m4aMdatHolding = [NSMutableData dataWithData:data];
+            }else {
+                [m4aMdatHolding appendData:data];
+            }
+            long l = [self locationMoov:m4aMdatHolding];
+            
+            if ( l == -2 ) {    //found moov before mdat
+                m4aMoovLoaded = YES;
+                error = AudioFileStreamParseBytes(audioFileStream, (UInt32)[m4aMdatHolding length], [m4aMdatHolding bytes], 0);
+            }
+            
+            if ( l > 0 ) {
+                //got moov location.
+                //1. 处理m4aMdataHolding，把locationL:mdat-4 之后bytes去掉
+                NSData * ftypData = [m4aMdatHolding subdataWithRange:NSMakeRange(0, m4aMdatLocation)];
+                [m4aMdatHolding replaceBytesInRange:NSMakeRange(0, m4aMdatLocation) withBytes:NULL length:0];
+                //NSLog(@"ftyp:%@", ftypData);
+                //NSLog(@"mdat:%@", m4aMdatHolding);
+                
+                //2. 然后传入parsebytes
+                error = AudioFileStreamParseBytes(audioFileStream, (UInt32)[ftypData length], [ftypData bytes], 0);
+                
+                //3. fetch moov sync? 或者要不要pause 掉run loop，就像用户点了pause一样
+                NSData * moov = 
+                error = AudioFileStreamParseBytes(audioFileStream, (UInt32)[moov length], [moov bytes], 0);
+                
+                //4. 再全部塞到parse里。
+                error = AudioFileStreamParseBytes(audioFileStream, (UInt32)[m4aMdatHolding length], [m4aMdatHolding bytes], 0);
+                
+                m4aMoovLoaded = YES;
+                
+            }
+            error = noErr;
+        }else {
+            error = AudioFileStreamParseBytes(audioFileStream, read, readBuffer, flags);
+        }
         
         if (error)
         {
+            //TODO Fallback here
+            NSLog(@"Parser failed.");
+            //
             if (dataSourceIn == currentlyPlayingEntry.dataSource)
             {
                 [self unexpectedError:STKAudioPlayerErrorStreamParseBytesFailed];
@@ -2127,6 +2245,31 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     }
 }
 
+
+//Create PlaybackSpeedUnit
+-(void) createplaybackRateUnit
+{
+    OSStatus status;
+    
+    CHECK_STATUS_AND_RETURN(AUGraphAddNode(audioGraph, &playbackrateUnitDescription, &playbackspeedNode));
+    CHECK_STATUS_AND_RETURN(AUGraphNodeInfo(audioGraph, playbackspeedNode, &playbackrateUnitDescription, &playbackspeedUnit));
+    
+    //maxframes changed here
+    CHECK_STATUS_AND_RETURN(AudioUnitSetProperty(playbackspeedUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFramesPerSlice, sizeof(maxFramesPerSlice)));
+#if TARGET_OS_IPHONE
+    
+    CHECK_STATUS_AND_RETURN(AudioUnitSetParameter(playbackspeedUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, 1, 0));
+    
+    
+    
+#endif
+    
+    CHECK_STATUS_AND_RETURN(AudioUnitSetProperty(playbackspeedUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, kOutputBus, &canonicalAudioStreamBasicDescription, sizeof(canonicalAudioStreamBasicDescription)));
+}
+
+
+
+
 -(void) createOutputUnit
 {
 	OSStatus status;
@@ -2305,7 +2448,10 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
 	
 	[self createEqUnit];
 	[self createMixerUnit];
+    //create playbackUnit
+    [self createplaybackRateUnit];
 	[self createOutputUnit];
+    
     
     [self connectGraph];
 	
@@ -2352,6 +2498,13 @@ static BOOL GetHardwareCodecClassDesc(UInt32 formatId, AudioClassDescription* cl
     {
         [nodes addObject:@(mixerNode)];
         [units addObject:[NSValue valueWithPointer:mixerUnit]];
+    }
+    
+    //Connect PlaybackSpeedNode
+    if (playbackspeedNode)
+    {
+        [nodes addObject:@(playbackspeedNode)];
+        [units addObject:[NSValue valueWithPointer:playbackspeedUnit]];
     }
 	
     if (outputNode)
@@ -3435,5 +3588,13 @@ static OSStatus OutputRenderCallback(void* inRefCon, AudioUnitRenderActionFlags*
     self->equalizerEnabled = value;
 }
 
+
+//setPlaybackSpeed
+-(void) setplaybackbackspeed:(float)value
+{
+
+    AudioUnitSetParameter(playbackspeedUnit, kNewTimePitchParam_Rate, kAudioUnitScope_Global, 0, value, 0);
+    
+}
 
 @end
